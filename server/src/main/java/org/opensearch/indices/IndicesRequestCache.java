@@ -39,11 +39,14 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.opensearch.common.CheckedSupplier;
-import org.opensearch.common.cache.Cache;
-import org.opensearch.common.cache.CacheBuilder;
-import org.opensearch.common.cache.CacheLoader;
+import org.opensearch.common.cache.CacheType;
+import org.opensearch.common.cache.ICache;
+import org.opensearch.common.cache.LoadAwareCacheLoader;
 import org.opensearch.common.cache.RemovalListener;
 import org.opensearch.common.cache.RemovalNotification;
+import org.opensearch.common.cache.policy.CachedQueryResult;
+import org.opensearch.common.cache.service.CacheService;
+import org.opensearch.common.cache.store.config.CacheConfig;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
@@ -69,6 +72,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
+import java.util.function.ToLongBiFunction;
 
 /**
  * The indices request cache allows to cache a shard level request stage responses, helping with improving
@@ -116,22 +120,34 @@ public final class IndicesRequestCache implements RemovalListener<IndicesRequest
     private final Set<CleanupKey> keysToClean = ConcurrentCollections.newConcurrentSet();
     private final ByteSizeValue size;
     private final TimeValue expire;
-    private final Cache<Key, BytesReference> cache;
+    private final ICache<Key, BytesReference> cache;
     private final Function<ShardId, Optional<CacheEntity>> cacheEntityLookup;
 
-    IndicesRequestCache(Settings settings, Function<ShardId, Optional<CacheEntity>> cacheEntityFunction) {
+    IndicesRequestCache(Settings settings, Function<ShardId, Optional<CacheEntity>> cacheEntityFunction, CacheService cacheService) {
         this.size = INDICES_CACHE_QUERY_SIZE.get(settings);
         this.expire = INDICES_CACHE_QUERY_EXPIRE.exists(settings) ? INDICES_CACHE_QUERY_EXPIRE.get(settings) : null;
         long sizeInBytes = size.getBytes();
-        CacheBuilder<Key, BytesReference> cacheBuilder = CacheBuilder.<Key, BytesReference>builder()
-            .setMaximumWeight(sizeInBytes)
-            .weigher((k, v) -> k.ramBytesUsed() + v.ramBytesUsed())
-            .removalListener(this);
-        if (expire != null) {
-            cacheBuilder.setExpireAfterAccess(expire);
-        }
-        cache = cacheBuilder.build();
+        ToLongBiFunction<Key, BytesReference> weigher = (k, v) -> k.ramBytesUsed() + v.ramBytesUsed();
         this.cacheEntityLookup = cacheEntityFunction;
+        this.cache = cacheService.createCache(
+            new CacheConfig.Builder<Key, BytesReference>().setSettings(settings)
+                .setWeigher(weigher)
+                .setValueType(BytesReference.class)
+                .setKeyType(Key.class)
+                .setRemovalListener(this)
+                .setMaxSizeInBytes(sizeInBytes) // for backward compatibility
+                .setExpireAfterAccess(expire) // for backward compatibility
+                .setCachedResultParser((bytesReference) -> {
+                    try {
+                        return CachedQueryResult.getPolicyValues(bytesReference);
+                    } catch (IOException e) {
+                        // Set took time to -1, which will always be rejected by the policy.
+                        return new CachedQueryResult.PolicyValues(-1);
+                    }
+                })
+                .build(),
+            CacheType.INDICES_REQUEST_CACHE
+        );
     }
 
     @Override
@@ -204,7 +220,7 @@ public final class IndicesRequestCache implements RemovalListener<IndicesRequest
      *
      * @opensearch.internal
      */
-    private static class Loader implements CacheLoader<Key, BytesReference> {
+    private static class Loader implements LoadAwareCacheLoader<Key, BytesReference> {
 
         private final CacheEntity entity;
         private final CheckedSupplier<BytesReference, IOException> loader;
@@ -403,7 +419,7 @@ public final class IndicesRequestCache implements RemovalListener<IndicesRequest
     /**
      * Returns the current size of the cache
      */
-    int count() {
+    long count() {
         return cache.count();
     }
 
